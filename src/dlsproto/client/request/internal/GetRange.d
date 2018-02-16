@@ -383,7 +383,18 @@ private scope class GetRangeHandler
         /// Resumes the `RecordStream` fiber.
         ResumeRecordStream = ControllerSignal.max + 1,
         /// Tells the `Controller` to terminate.
-        StopController
+        StopController,
+        /// Tells the reader to continue processing the next batch
+        ReadNextBatch
+    }
+
+    /// tells if the fiber is suspended, and if yes, what it is waiting for.
+    enum FiberSuspended: uint
+    {
+        No,
+        WaitingForRecords,
+        RequestSuspended,
+        ProcessingBatch
     }
 
     /**************************************************************************
@@ -396,24 +407,17 @@ private scope class GetRangeHandler
 
     ***************************************************************************/
 
+    /// Slices the records in *batch_buffer that haven't been processed yet
+    private Const!(void)[] remaining_batch = null;
+
     private /* scope */ class RecordStream
     {
         /// The acquired buffer to store a batch of records.
         private void[]* batch_buffer;
 
-        /// Slices the records in *batch_buffer that haven't been processed yet
-        private Const!(void)[] remaining_batch = null;
-
         /// The fiber.
         private MessageFiber fiber;
 
-        /// tells if the fiber is suspended, and if yes, what it is waiting for.
-        enum FiberSuspended: uint
-        {
-            No,
-            WaitingForRecords,
-            RequestSuspended
-        }
 
         /// ditto
         private FiberSuspended fiber_suspended;
@@ -457,9 +461,9 @@ private scope class GetRangeHandler
             // the remaining records. To void a dangling slice if
             // *this.batch_buffer is relocated, set this.remaining_batch to
             // null first.
-            size_t n_processed = (*this.batch_buffer).length - this.remaining_batch.length;
+            size_t n_processed = (*this.batch_buffer).length - remaining_batch.length;
             (*this.batch_buffer) ~= record_batch;
-            this.remaining_batch = (*this.batch_buffer)[n_processed .. $];
+            remaining_batch = (*this.batch_buffer)[n_processed .. $];
 
             if (this.fiber_suspended == fiber_suspended.WaitingForRecords)
                 this.resumeFiber();
@@ -510,7 +514,16 @@ private scope class GetRangeHandler
         {
             while (this.waitForRecords())
             {
-                for (uint yield_count = 0; this.remaining_batch.length; yield_count++)
+                this.outer.request_event_dispatcher.send(
+                    this.fiber,
+                    (conn.Payload payload)
+                    {
+                        payload.addConstant(MessageType_v1.Continue);
+                    }
+                );
+                this.outer.conn.flush();
+
+                for (uint yield_count = 0; remaining_batch.length; yield_count++)
                 {
                     if (yield_count >= 10) //yield every 10 records
                     {
@@ -527,28 +540,26 @@ private scope class GetRangeHandler
 
                     this.passRecordToUser(
                         *this.outer.conn.message_parser.getValue!(time_t)(
-                            this.remaining_batch),
+                            remaining_batch),
                         this.outer.conn.message_parser.getArray!(Const!(void))(
-                            this.remaining_batch
+                            remaining_batch
                         ));
 
                 }
 
-                this.remaining_batch = null;
+                remaining_batch = null;
                 (*this.batch_buffer).length = 0;
+
+                /// resume reader if suspended
+                //if (this.outer.reader.fiber_suspended != FiberSuspended.No)
+                if (this.outer.reader_suspended)
+                {
+                    this.outer.request_event_dispatcher.signal(this.outer.conn,
+                        FiberSignal.ReadNextBatch);
+                }
 
                 if (this.stopped)
                     break;
-
-                this.outer.request_event_dispatcher.send(
-                    this.fiber,
-                    (conn.Payload payload)
-                    {
-                        payload.addConstant(MessageType_v1.Continue);
-                    }
-                );
-
-                this.outer.conn.flush();
             }
 
             this.outer.request_event_dispatcher.signal(this.outer.conn,
@@ -706,6 +717,12 @@ private scope class GetRangeHandler
                 switch (msg.type)
                 {
                     case MessageType_v1.Records:
+                        // Wait until the previous batch is processed
+                        if (remaining_batch.length > 0)
+                        {
+                            this.suspendFiber(FiberSuspended.ProcessingBatch);
+                        }
+
                         Const!(void)[] received_record_batch;
                         size_t uncompressed_batch_size;
 
@@ -746,8 +763,38 @@ private scope class GetRangeHandler
 
             this.record_stream.stop();
         }
+
+        /**********************************************************************
+
+            Suspends the fiber, waiting for `FiberSignal.ResumeRecordStream`.
+            `why` specifies the current state of the fiber method and determines
+            which of the public methods should raise that signal.
+
+            Params:
+                why = the event on which the fiber method needs to be resumed.
+
+        **********************************************************************/
+
+        private void suspendFiber (FiberSuspended why)
+        {
+            this.fiber_suspended = why;
+            this.outer.reader_suspended = true;
+            try
+            {
+                this.outer.request_event_dispatcher.nextEvent(this.fiber,
+                    Signal(FiberSignal.ReadNextBatch));
+            }
+            finally
+            {
+                this.fiber_suspended = this.fiber_suspended.No;
+                this.outer.reader_suspended = false;
+            }
+        }
+
+        private FiberSuspended fiber_suspended;
     }
 
+    bool reader_suspended;
 
     /**************************************************************************
 
